@@ -1,0 +1,110 @@
+name: Android APK (sideload build)
+
+# Android-only build for this personal fork. No release keystore is used:
+# android/app/build.gradle.kts falls back to the debug signing key when the
+# ANDROID_* signing values are absent, so the APK installs by sideloading.
+# Start it with the "Run workflow" button on this workflow's Actions page.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: "3.41.4"
+  APP_NAME: meshcore-sar
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # flutter_avif_android 3.1.0 ships the same FlutterAvifPlugin class in
+      # both Java and Kotlin. Upstream's android/build.gradle.kts empties the
+      # plugin's Java source dir, but on CI the Kotlin copy is never compiled,
+      # so :app fails with "cannot find symbol FlutterAvifPlugin". Keep the
+      # Java copy instead: delete the Kotlin duplicate and skip that block.
+      - name: Fix flutter_avif_android duplicate plugin class
+        run: |
+          set -euo pipefail
+          AVIF_DIR="$(python3 -c "import json; d=json.load(open('.flutter-plugins-dependencies')); print(next(p['path'] for p in d['plugins']['android'] if p['name']=='flutter_avif_android'))")"
+          echo "flutter_avif_android at: $AVIF_DIR"
+          rm -rf "$AVIF_DIR/android/src/main/kotlin"
+          test -f "$AVIF_DIR/android/src/main/java/com/teknorota/flutter_avif/FlutterAvifPlugin.java"
+          sed -i 's/if (project.name == "flutter_avif_android") {/if (false \&\& project.name == "flutter_avif_android") {/' android/build.gradle.kts
+          grep -n 'if (false && project.name == "flutter_avif_android")' android/build.gradle.kts
+
+      - name: Build APK
+        env:
+          COMMIT_HASH: ${{ github.sha }}
+        run: flutter build apk --release
+
+      - name: Inspect APK
+        id: inspect
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          OUT="${APP_NAME}-${SHORT_SHA}-android.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "$OUT"
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          {
+            echo "Unofficial sideload build of dz0ny/meshcore-sar at commit ${GITHUB_SHA}, built by GitHub Actions run ${GITHUB_RUN_ID}."
+            echo "Signed with the Android debug key (no release keystore). Uninstall any official build before installing."
+            echo
+            echo '```'
+            "$BT/aapt2" dump badging "$OUT" | grep -E "^(package|sdkVersion|targetSdkVersion|native-code|application-label):" || true
+            echo "size_bytes: $(stat -c %s "$OUT")"
+            echo "sha256: $(sha256sum "$OUT" | cut -d' ' -f1)"
+            "$BT/apksigner" verify --print-certs "$OUT" | grep -E "Signer #1 certificate (DN|SHA-256)" || true
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+          echo "apk=$OUT" >> "$GITHUB_OUTPUT"
+          echo "tag=apk-${SHORT_SHA}-r${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshcore-sar-android-apk
+          path: ${{ steps.inspect.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach APK to a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.inspect.outputs.tag }}" "${{ steps.inspect.outputs.apk }}" \
+            --draft --target "$GITHUB_SHA" \
+            --title "MeshCore SAR Android sideload build (${GITHUB_SHA::7})" \
+            --notes-file release-notes.md
